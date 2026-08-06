@@ -820,42 +820,58 @@ llama_model_loader::llama_model_loader(
 
     // --- gguf-artifact payload source (validation swap) ---------------------
     // Active only when GGUFA_LOADER is set, so the SAME binary can be run vanilla
-    // (unset) and gguf-artifact-backed (set) for a differential oracle.
+    // (unset) and gguf-artifact-backed (set) for a differential oracle. One mmap
+    // source per shard so split models route every shard through gguf-artifact.
     if (getenv("GGUFA_LOADER")) {
-        ggufa_error gerr{};
         ggufa_source_open_options sopt{};
         sopt.struct_size = sizeof(sopt);
         ggufa_source_open_options_init(&sopt);
         sopt.access_mode = GGUFA_SOURCE_ACCESS_IMMUTABLE_MMAP;  // zero-copy borrow hot path
-        const ggufa_string_view pview{fname.c_str(), fname.size()};
-        ggufa_source * src = nullptr;
-        const ggufa_status open_s = ggufa_source_open_file(pview, nullptr, &sopt, &src, &gerr);
-        if (open_s == GGUFA_STATUS_OK && src) {
+
+        // Per-shard path list in file order: files[0] = fname, files[i] = splits[i].
+        std::vector<std::string> shard_paths{fname};
+        for (size_t i = 1; i < splits.size() && i < files.size(); ++i) {
+            shard_paths.emplace_back(splits[i]);
+        }
+        ggufa_sources.assign(files.size(), nullptr);
+        ggufa_name_index.assign(files.size(), {});
+        std::uint64_t total_indexed = 0;
+        for (size_t fi = 0; fi < shard_paths.size() && fi < files.size(); ++fi) {
+            const std::string & sp = shard_paths[fi];
+            ggufa_error gerr{};
+            ggufa_source * src = nullptr;
+            const ggufa_string_view pview{sp.c_str(), sp.size()};
+            const ggufa_status open_s = ggufa_source_open_file(pview, nullptr, &sopt, &src, &gerr);
+            if (open_s != GGUFA_STATUS_OK || !src) {
+                fprintf(stderr, "[GGUFA] could not open shard '%s' (status=%d: %s); native fallback for idx %zu\n",
+                        sp.c_str(), (int) open_s, ggufa_status_name(open_s), fi);
+                continue;
+            }
             const ggufa_document * doc = ggufa_source_document(src);
             ggufa_header_view hdr{};
-            if (doc && ggufa_document_header(doc, &hdr, &gerr) == GGUFA_STATUS_OK) {
-                // Store src FIRST so the loader dtor owns it even if indexing below throws.
-                if (ggufa_sources.empty()) {
-                    ggufa_sources.resize(1, nullptr);
-                }
-                ggufa_sources[0] = src;  // primary file (idx 0); split files fall back to native
-                ggufa_name_index.emplace_back();
-                for (uint64_t i = 0; i < hdr.tensor_count; ++i) {
-                    ggufa_tensor_view tv{};
-                    if (ggufa_document_tensor_at(doc, i, &tv, &gerr) == GGUFA_STATUS_OK) {
-                        ggufa_name_index.back()[std::string(tv.name.data, tv.name.size)] = i;
-                    }
-                }
-                ggufa_ok = true;
-                fprintf(stderr, "[GGUFA] payload reads routed via gguf-artifact (%llu tensors indexed)\n",
-                        (unsigned long long) hdr.tensor_count);
-            } else {
-                fprintf(stderr, "[GGUFA] opened file but catalogue read failed; using native reads\n");
+            if (!doc || ggufa_document_header(doc, &hdr, &gerr) != GGUFA_STATUS_OK) {
+                fprintf(stderr, "[GGUFA] shard '%s' catalogue read failed; native fallback for idx %zu\n",
+                        sp.c_str(), fi);
                 ggufa_source_destroy(src);
+                continue;
             }
-        } else {
-            fprintf(stderr, "[GGUFA] could not open '%s' (status=%d: %s); using native reads\n",
-                    fname.c_str(), (int) open_s, ggufa_status_name(open_s));
+            ggufa_sources[fi] = src;  // stored first; loader dtor owns it
+            auto & idx = ggufa_name_index[fi];
+            for (uint64_t i = 0; i < hdr.tensor_count; ++i) {
+                ggufa_tensor_view tv{};
+                if (ggufa_document_tensor_at(doc, i, &tv, &gerr) == GGUFA_STATUS_OK) {
+                    idx[std::string(tv.name.data, tv.name.size)] = i;
+                }
+            }
+            total_indexed += hdr.tensor_count;
+        }
+        ggufa_ok = std::any_of(ggufa_sources.begin(), ggufa_sources.end(),
+                               [](ggufa_source * s) { return s != nullptr; });
+        if (ggufa_ok) {
+            const size_t opened = std::count_if(ggufa_sources.begin(), ggufa_sources.end(),
+                                                [](ggufa_source * s) { return s != nullptr; });
+            fprintf(stderr, "[GGUFA] mmap sources opened for %zu/%zu shard(s) (%llu tensors indexed)\n",
+                    opened, files.size(), (unsigned long long) total_indexed);
         }
     }
 }
@@ -1450,16 +1466,14 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             }
 
             std::unique_ptr<llama_mmap> mapping;
-            // Adopt gguf-artifact's IMMUTABLE_MMAP region for the primary file so the
+            // Adopt gguf-artifact's IMMUTABLE_MMAP region for this shard so the
             // whole mmap path reads through a single shared mapping (zero-copy borrow).
-            if (ggufa_ok && file_idx == 0 && file_idx < ggufa_sources.size() && ggufa_sources[file_idx]) {
+            if (ggufa_ok && file_idx < ggufa_sources.size() && ggufa_sources[file_idx]) {
                 const uint8_t * base = nullptr;
                 uint64_t region_size = 0;
                 ggufa_error gerr{};
                 if (ggufa_source_mapping_region(ggufa_sources[file_idx], &base, &region_size, &gerr) == GGUFA_STATUS_OK && base) {
                     mapping = llama_mmap::adopt(const_cast<uint8_t *>(base), (size_t) region_size);
-                    fprintf(stderr, "[GGUFA] mmap path adopted gguf-artifact mapping (%llu bytes)\n",
-                            (unsigned long long) region_size);
                 }
             }
             if (!mapping) {
