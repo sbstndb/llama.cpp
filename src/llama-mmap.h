@@ -52,9 +52,17 @@ struct llama_mmap {
 
     static const bool SUPPORTED;
 
+    // Wrap an EXTERNAL read-only mapping [addr, addr+size) without owning it: the
+    // destructor will NOT munmap/UnmapViewOfFile (the caller owns the region's
+    // lifetime). Used to route llama's mmap path through a host-provided mapping
+    // (e.g. gguf-artifact's IMMUTABLE_MMAP) instead of llama's own mmap().
+    static std::unique_ptr<llama_mmap> adopt(void * addr, size_t size);
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+    // internal: wrap an external mapping (owns == false)
+    explicit llama_mmap(void * addr, size_t size, bool /*adopt_tag*/);
 };
 
 struct llama_mlock {

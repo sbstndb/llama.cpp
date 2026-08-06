@@ -15,6 +15,11 @@
 #include <stdexcept>
 #include <unordered_map>
 
+// Forward decl: gguf-artifact payload source (validation swap, see .cpp).
+// When GGUFA_LOADER is set in the environment, tensor payload bytes are read via
+// the gguf-artifact C ABI instead of llama.cpp's native file reader.
+struct ggufa_source;
+
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
 // lists of buffer types used for each layer
@@ -119,6 +124,28 @@ struct llama_model_loader {
     std::string first_tensor_moved_type_name;
     ggml_backend_buffer_type_t first_moved_from_buft = nullptr;
     ggml_backend_buffer_type_t first_moved_to_buft = nullptr;
+
+    // --- gguf-artifact payload sources (owned, destroyed in ~llama_model_loader) ---
+    // Indexed by source file idx (0 == primary file). A null entry means that file
+    // is served by the native reader. ggufa_name_index[idx][tensor_name] -> tensor index.
+    std::vector<ggufa_source *> ggufa_sources;
+    std::vector<std::unordered_map<std::string, uint64_t>> ggufa_name_index;
+    bool ggufa_ok = false;
+    mutable size_t ggufa_reads = 0;   // counter: tensors actually read via gguf-artifact
+    mutable size_t ggufa_borrows = 0; // counter: tensors zero-copy-borrowed via gguf-artifact
+
+    // Read one tensor's payload via gguf-artifact. Returns false if the swap is not
+    // active for this file/tensor (caller falls back to the native reader).
+    bool ggufa_read(int file_idx, const char * name, void * dest, size_t n_bytes) const;
+    // Borrow one tensor's payload as a zero-copy pointer into the gguf-artifact
+    // mmap mapping (IMMUTABLE_MMAP). Returns false if unavailable (caller falls
+    // back to the native mmap pointer).
+    bool ggufa_borrow(int file_idx, const char * name, size_t n_bytes, const uint8_t ** out) const;
+    // Hand ownership of the gguf-artifact mmap sources to the caller (model), so
+    // their mappings outlive the loader. Leaves the loader's vector empty.
+    std::vector<ggufa_source *> release_ggufa_sources();
+
+    ~llama_model_loader();
 
     llama_model_loader(
         struct gguf_context * metadata,

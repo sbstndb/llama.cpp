@@ -8,6 +8,8 @@
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 
+#include "gguf_artifact/c/gguf_artifact.h"
+
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
@@ -1002,7 +1004,14 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+        // Destroy the gguf-artifact mmap sources backing the adopted mappings.
+        for (ggufa_source * src : ggufa_sources) {
+            if (src) {
+                ggufa_source_destroy(src);
+            }
+        }
+    }
 
     uint64_t n_elements = 0;
 
@@ -1014,6 +1023,10 @@ struct llama_model::impl {
 
     // model memory mapped files
     llama_mmaps mappings;
+
+    // gguf-artifact mmap sources whose mappings back `mappings` (adopt path).
+    // Owned here so they outlive the loader; destroyed in ~impl via ggufa_source_destroy.
+    std::vector<ggufa_source *> ggufa_sources;
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
@@ -1659,6 +1672,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+        // Transfer ownership of the gguf-artifact mmap sources to the model: their
+        // mappings back the adopted llama_mmap entries above and must live as long.
+        pimpl->ggufa_sources = std::move(ml.release_ggufa_sources());
     }
 
     return true;

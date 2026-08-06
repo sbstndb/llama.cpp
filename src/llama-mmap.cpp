@@ -475,6 +475,13 @@ struct llama_mmap::impl {
         mapped_fragments.emplace_back(0, file->size());
     }
 
+    // Wrap an external read-only mapping we do NOT own (owns == false): the dtor
+    // and unmap_fragment become no-ops so the host retains full mapping ownership.
+    impl(void * external_addr, size_t external_size)
+        : addr(external_addr), size(external_size), owns(false) {
+        mapped_fragments.emplace_back(0, size);
+    }
+
     static void align_range(size_t * first, size_t * last, size_t page_size) {
         size_t offset_in_page = *first & (page_size - 1);
         size_t offset_to_page = offset_in_page == 0 ? 0 : page_size - offset_in_page;
@@ -488,6 +495,9 @@ struct llama_mmap::impl {
     }
 
     void unmap_fragment(size_t first, size_t last) {
+        if (!owns) {
+            return;  // external mapping: do not unmap fragments we do not own
+        }
         int page_size = sysconf(_SC_PAGESIZE);
         align_range(&first, &last, page_size);
         size_t len = last - first;
@@ -524,6 +534,9 @@ struct llama_mmap::impl {
     }
 
     ~impl() {
+        if (!owns) {
+            return;  // external mapping: lifetime owned by the host
+        }
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
@@ -577,12 +590,19 @@ struct llama_mmap::impl {
         }
     }
 
+    // external mapping (not owned): Windows build path
+    impl(void * external_addr, size_t external_size)
+        : addr(external_addr), size(external_size), owns(false), hMapping(nullptr) {}
+
     void unmap_fragment(size_t first, size_t last) {
         GGML_UNUSED(first);
         GGML_UNUSED(last);
     }
 
     ~impl() {
+        if (!owns) {
+            return;
+        }
         if (hMapping) {
             if (addr) {
                 if (!UnmapViewOfFile(addr)) {
@@ -605,6 +625,10 @@ struct llama_mmap::impl {
         throw std::runtime_error("mmap not supported");
     }
 
+    // external mapping (not owned): unsupported-platform build path
+    impl(void * external_addr, size_t external_size)
+        : addr(external_addr), size(external_size), owns(false) {}
+
     void unmap_fragment(size_t first, size_t last) {
         GGML_UNUSED(first);
         GGML_UNUSED(last);
@@ -615,10 +639,16 @@ struct llama_mmap::impl {
 
     void * addr;
     size_t size;
+    bool owns = true;
 };
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa) : pimpl(std::make_unique<impl>(file, prefetch, numa)) {}
+llama_mmap::llama_mmap(void * addr, size_t size, bool) : pimpl(std::make_unique<impl>(addr, size)) {}
 llama_mmap::~llama_mmap() = default;
+
+std::unique_ptr<llama_mmap> llama_mmap::adopt(void * addr, size_t size) {
+    return std::unique_ptr<llama_mmap>(new llama_mmap(addr, size, true));
+}
 
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }

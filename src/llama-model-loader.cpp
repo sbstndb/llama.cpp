@@ -6,10 +6,13 @@
 #include "llama-hparams.h"
 #include "llama.h"
 
+#include "gguf_artifact/c/gguf_artifact.h"
+
 #include <algorithm>
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <regex>
@@ -814,10 +817,111 @@ llama_model_loader::llama_model_loader(
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
     this->load_mtp = load_mtp;
+
+    // --- gguf-artifact payload source (validation swap) ---------------------
+    // Active only when GGUFA_LOADER is set, so the SAME binary can be run vanilla
+    // (unset) and gguf-artifact-backed (set) for a differential oracle.
+    if (getenv("GGUFA_LOADER")) {
+        ggufa_error gerr{};
+        ggufa_source_open_options sopt{};
+        sopt.struct_size = sizeof(sopt);
+        ggufa_source_open_options_init(&sopt);
+        sopt.access_mode = GGUFA_SOURCE_ACCESS_IMMUTABLE_MMAP;  // zero-copy borrow hot path
+        const ggufa_string_view pview{fname.c_str(), fname.size()};
+        ggufa_source * src = nullptr;
+        const ggufa_status open_s = ggufa_source_open_file(pview, nullptr, &sopt, &src, &gerr);
+        if (open_s == GGUFA_STATUS_OK && src) {
+            const ggufa_document * doc = ggufa_source_document(src);
+            ggufa_header_view hdr{};
+            if (doc && ggufa_document_header(doc, &hdr, &gerr) == GGUFA_STATUS_OK) {
+                // Store src FIRST so the loader dtor owns it even if indexing below throws.
+                if (ggufa_sources.empty()) {
+                    ggufa_sources.resize(1, nullptr);
+                }
+                ggufa_sources[0] = src;  // primary file (idx 0); split files fall back to native
+                ggufa_name_index.emplace_back();
+                for (uint64_t i = 0; i < hdr.tensor_count; ++i) {
+                    ggufa_tensor_view tv{};
+                    if (ggufa_document_tensor_at(doc, i, &tv, &gerr) == GGUFA_STATUS_OK) {
+                        ggufa_name_index.back()[std::string(tv.name.data, tv.name.size)] = i;
+                    }
+                }
+                ggufa_ok = true;
+                fprintf(stderr, "[GGUFA] payload reads routed via gguf-artifact (%llu tensors indexed)\n",
+                        (unsigned long long) hdr.tensor_count);
+            } else {
+                fprintf(stderr, "[GGUFA] opened file but catalogue read failed; using native reads\n");
+                ggufa_source_destroy(src);
+            }
+        } else {
+            fprintf(stderr, "[GGUFA] could not open '%s' (status=%d: %s); using native reads\n",
+                    fname.c_str(), (int) open_s, ggufa_status_name(open_s));
+        }
+    }
+}
+
+llama_model_loader::~llama_model_loader() {
+    if (ggufa_ok) {
+        fprintf(stderr, "[GGUFA] %zu reads + %zu zero-copy borrows served via gguf-artifact\n",
+                ggufa_reads, ggufa_borrows);
+    }
+    for (ggufa_source * src : ggufa_sources) {
+        if (src) {
+            ggufa_source_destroy(src);
+        }
+    }
+}
+
+bool llama_model_loader::ggufa_read(int file_idx, const char * name, void * dest, size_t n_bytes) const {
+    if (!ggufa_ok || file_idx < 0 || file_idx >= (int) ggufa_sources.size() || !ggufa_sources[file_idx] ||
+        file_idx >= (int) ggufa_name_index.size()) {
+        return false;
+    }
+    const auto it = ggufa_name_index[file_idx].find(name);
+    if (it == ggufa_name_index[file_idx].end()) {
+        return false;
+    }
+    ggufa_error gerr{};
+    const ggufa_status s = ggufa_source_read_tensor(ggufa_sources[file_idx], it->second,
+                                                     0, n_bytes, (uint8_t *) dest, n_bytes, &gerr);
+    if (s != GGUFA_STATUS_OK) {
+        LLAMA_LOG_WARN("%s: gguf-artifact read failed for '%s' (%s); using native read\n",
+                       __func__, name, ggufa_status_name(s));
+        return false;
+    }
+    ggufa_reads++;
+    return true;
+}
+
+bool llama_model_loader::ggufa_borrow(int file_idx, const char * name, size_t n_bytes,
+                                      const uint8_t ** out) const {
+    if (!ggufa_ok || file_idx < 0 || file_idx >= (int) ggufa_sources.size() || !ggufa_sources[file_idx] ||
+        file_idx >= (int) ggufa_name_index.size()) {
+        return false;
+    }
+    const auto it = ggufa_name_index[file_idx].find(name);
+    if (it == ggufa_name_index[file_idx].end()) {
+        return false;
+    }
+    const uint8_t * ptr = nullptr;
+    uint64_t len = 0;
+    ggufa_error gerr{};
+    const ggufa_status s = ggufa_source_borrow_tensor(ggufa_sources[file_idx], it->second, 0,
+                                                       n_bytes, &ptr, &len, &gerr);
+    if (s != GGUFA_STATUS_OK || ptr == nullptr || len != n_bytes) {
+        return false;  // fall back to native mmap pointer
+    }
+    *out = ptr;
+    ggufa_borrows++;
+    return true;
 }
 
 std::string llama_model_loader::get_arch_name() const {
     return arch_name;
+}
+
+std::vector<ggufa_source *> llama_model_loader::release_ggufa_sources() {
+    return std::move(ggufa_sources);  // leaves ggufa_sources empty so the dtor won't double-destroy
 }
 
 enum llm_arch llama_model_loader::get_arch() const {
@@ -1332,6 +1436,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
+        uint32_t file_idx = 0;
         for (const auto & file : files) {
             bool is_numa = false;
 
@@ -1344,7 +1449,22 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
+            std::unique_ptr<llama_mmap> mapping;
+            // Adopt gguf-artifact's IMMUTABLE_MMAP region for the primary file so the
+            // whole mmap path reads through a single shared mapping (zero-copy borrow).
+            if (ggufa_ok && file_idx == 0 && file_idx < ggufa_sources.size() && ggufa_sources[file_idx]) {
+                const uint8_t * base = nullptr;
+                uint64_t region_size = 0;
+                ggufa_error gerr{};
+                if (ggufa_source_mapping_region(ggufa_sources[file_idx], &base, &region_size, &gerr) == GGUFA_STATUS_OK && base) {
+                    mapping = llama_mmap::adopt(const_cast<uint8_t *>(base), (size_t) region_size);
+                    fprintf(stderr, "[GGUFA] mmap path adopted gguf-artifact mapping (%llu bytes)\n",
+                            (unsigned long long) region_size);
+                }
+            }
+            if (!mapping) {
+                mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
+            }
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1352,6 +1472,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 mlock_mmaps->emplace_back(std::move(mlock_mmap));
             }
             mappings.emplace_back(std::move(mapping));
+            ++file_idx;
         }
     }
 
@@ -1382,6 +1503,10 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     const auto & w = require_weight(ggml_get_name(cur));
 
     if (use_mmap) {
+        // For file_idx 0, mappings[0] is the gguf-artifact mapping (adopted in
+        // init_mappings), so mapping->addr() + w.offs is already a pointer into
+        // gguf-artifact's mapping (zero-copy). Split files (idx>0) keep llama.cpp's
+        // own mmap. The gguf-artifact path also serves the --no-mmap branch below.
         const auto & mapping = mappings.at(w.idx);
         if (cur->data == nullptr) {
             cur->data = (uint8_t *)mapping->addr() + w.offs;
@@ -1391,9 +1516,11 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     } else {
         GGML_ASSERT(cur->data != nullptr);
         GGML_ASSERT(w.idx < files.size());
-        const auto & file = files.at(w.idx);
-        file->seek(w.offs, SEEK_SET);
-        file->read_raw(cur->data, ggml_nbytes(cur));
+        if (!ggufa_read(w.idx, ggml_get_name(cur), cur->data, ggml_nbytes(cur))) {
+            const auto & file = files.at(w.idx);
+            file->seek(w.offs, SEEK_SET);
+            file->read_raw(cur->data, ggml_nbytes(cur));
+        }
     }
 
     if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
@@ -1538,6 +1665,8 @@ bool llama_model_loader::load_all_data(
                 buf_mmap = bufs.at(weight->idx);
             }
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
+            // mapping->addr() is gguf-artifact's mapping base for idx 0 (adopted),
+            // so `data` points into gguf-artifact's mapping: zero-copy through it.
 
             if (check_tensors) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
@@ -1563,8 +1692,10 @@ bool llama_model_loader::load_all_data(
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
+                if (!ggufa_read(weight->idx, ggml_get_name(cur), cur->data, n_size)) {
+                    file->seek(weight->offs, SEEK_SET);
+                    file->read_raw(cur->data, n_size);
+                }
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
@@ -1626,8 +1757,10 @@ bool llama_model_loader::load_all_data(
                     }
                 } else {
                     read_buf.resize(n_size);
-                    file->seek(weight->offs, SEEK_SET);
-                    file->read_raw(read_buf.data(), n_size);
+                    if (!ggufa_read(weight->idx, ggml_get_name(cur), read_buf.data(), n_size)) {
+                        file->seek(weight->offs, SEEK_SET);
+                        file->read_raw(read_buf.data(), n_size);
+                    }
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
                     if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));

@@ -55,6 +55,19 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+# --- gguf-artifact payload source (validation swap) -------------------------
+# Routes tensor payload reads through the gguf-artifact C ABI when GGUFA_LOADER
+# is set at runtime. Paths point at the pre-built gguf_artifact C ABI.
+set(GGUFA_INCLUDE_DIR "/root/gguf_artifact/include" CACHE PATH "gguf-artifact include dir")
+set(GGUFA_LIBRARY    "/root/gguf_artifact/build/libgguf_artifact_c.so" CACHE FILEPATH "gguf-artifact C ABI shared lib")
+if(EXISTS "${GGUFA_LIBRARY}")
+    target_include_directories(llama PRIVATE "${GGUFA_INCLUDE_DIR}")
+    target_link_libraries(llama PRIVATE "${GGUFA_LIBRARY}")
+    set_target_properties(llama PROPERTIES BUILD_RPATH "/root/gguf_artifact/build")
+else()
+    message(WARNING "gguf-artifact C ABI not found at ${GGUFA_LIBRARY}; swap disabled (builds vanilla)")
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
