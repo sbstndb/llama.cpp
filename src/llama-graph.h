@@ -996,8 +996,7 @@ struct llm_graph_context {
          llm_ffn_op_type   type_op,
        llm_ffn_gate_type   type_gate,
                      int   il,
-             ggml_tensor * down_part0 = nullptr,
-             ggml_tensor * down_part1 = nullptr) const;
+             std::vector<ggml_tensor *> down_parts = {}) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(

@@ -1576,8 +1576,7 @@ ggml_tensor * llm_graph_context::build_ffn(
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
                  int   il,
-         ggml_tensor * down_part0,
-         ggml_tensor * down_part1) const {
+         std::vector<ggml_tensor *> down_parts) const {
     // NVFP4 support is currently restricted to
     // 1) LORA absence (*_s would be applied after LORA residual, which is incorrect)
     // 2) bias absense (*_s would be applied after bias addition, which is incorrect)
@@ -1747,10 +1746,16 @@ ggml_tensor * llm_graph_context::build_ffn(
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
         }
-    } else if (down_part0 && down_part1) {
-        auto * r0 = ggml_mul_mat(ctx0, down_part0, cur);
-        auto * r1 = ggml_mul_mat(ctx0, down_part1, cur);
-        cur = ggml_concat(ctx0, r0, r1, 0);
+    } else if (!down_parts.empty()) {
+        // Generic N-way split: mul_mat each part against the SAME activation,
+        // then concat all partial results along ne[0] (output dim) to rebuild ffn_down.
+        // NOTE: do not clobber `cur` (the activation) — keep it for every part.
+        auto * acc = ggml_mul_mat(ctx0, down_parts[0], cur);
+        for (size_t i = 1; i < down_parts.size(); ++i) {
+            auto * r = ggml_mul_mat(ctx0, down_parts[i], cur);
+            acc = ggml_concat(ctx0, acc, r, 0);
+        }
+        cur = acc;
     }
 
     if (down_b) {

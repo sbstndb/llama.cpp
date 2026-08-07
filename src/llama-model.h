@@ -294,9 +294,9 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate     = nullptr; // w1
     struct ggml_tensor * ffn_down     = nullptr; // w2
     struct ggml_tensor * ffn_up       = nullptr; // w3
-    // Split tensor parts (when ffn_down is split into row-groups)
-    struct ggml_tensor * ffn_down_part0 = nullptr;
-    struct ggml_tensor * ffn_down_part1 = nullptr;
+    // Split tensor parts (when ffn_down is split into N row-groups along ne[1],
+    // each independently quantized — generic mixed-precision). Empty when unsplit.
+    std::vector<struct ggml_tensor *> ffn_down_parts;
     struct ggml_tensor * ffn_gate_enc = nullptr;
     struct ggml_tensor * ffn_down_enc = nullptr;
     struct ggml_tensor * ffn_up_enc   = nullptr;

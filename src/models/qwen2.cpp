@@ -42,15 +42,19 @@ void llama_model_qwen2::load_arch_tensors(llama_model_loader &) {
 
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, TENSOR_NOT_REQUIRED);
-        // Optional split parts (split along ne[1] = n_embd = output dim)
+        // Optional generic split: ffn_down split into N row-groups along ne[1] (n_embd),
+        // each part independently quantized. Sizes come from split_size.{k} metadata.
         {
-            std::string split_key = tn(LLM_TENSOR_FFN_DOWN, "weight", i).str() + ".split_rows";
-            uint32_t split_rows = 0;
-            if (ml->get_key(split_key, split_rows, false)) {
-                const int64_t n_embd_part0 = split_rows;
-                const int64_t n_embd_part1 = n_embd - n_embd_part0;
-                layer.ffn_down_part0 = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight.0", i), {n_ff, n_embd_part0}, TENSOR_NOT_REQUIRED);
-                layer.ffn_down_part1 = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight.1", i), {n_ff, n_embd_part1}, TENSOR_NOT_REQUIRED);
+            std::string base = tn(LLM_TENSOR_FFN_DOWN, "weight", i).str();
+            uint32_t split_count = 0;
+            if (ml->get_key(base + ".split_count", split_count, false) && split_count > 0) {
+                for (uint32_t k = 0; k < split_count; ++k) {
+                    uint32_t sz = 0;
+                    ml->get_key(base + ".split_size." + std::to_string(k), sz, true);
+                    std::string suf = "weight." + std::to_string(k);
+                    layer.ffn_down_parts.push_back(
+                        create_tensor(tn(LLM_TENSOR_FFN_DOWN, suf.c_str(), i), {n_ff, (int64_t) sz}, TENSOR_NOT_REQUIRED));
+                }
             }
         }
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
@@ -133,7 +137,7 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
                 model.layers[il].ffn_down, NULL, NULL,
                 NULL,
                 LLM_FFN_SILU, LLM_FFN_PAR, il,
-                model.layers[il].ffn_down_part0, model.layers[il].ffn_down_part1);
+                model.layers[il].ffn_down_parts);
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, cur, ffn_inp);
