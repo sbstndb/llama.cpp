@@ -299,6 +299,11 @@ struct llama_layer {
     std::vector<struct ggml_tensor *> ffn_down_parts;
     std::vector<struct ggml_tensor *> ffn_up_parts;
     std::vector<struct ggml_tensor *> ffn_gate_parts;
+    // Attention split parts (q/k/v/o projections split along ne[1]).
+    std::vector<struct ggml_tensor *> wq_parts;
+    std::vector<struct ggml_tensor *> wk_parts;
+    std::vector<struct ggml_tensor *> wv_parts;
+    std::vector<struct ggml_tensor *> wo_parts;
     struct ggml_tensor * ffn_gate_enc = nullptr;
     struct ggml_tensor * ffn_down_enc = nullptr;
     struct ggml_tensor * ffn_up_enc   = nullptr;

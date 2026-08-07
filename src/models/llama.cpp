@@ -65,8 +65,17 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
-        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_k_gqa, n_embd_v_gqa, 0);
-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_k_gqa, n_embd_v_gqa, TENSOR_NOT_REQUIRED);
+        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, TENSOR_NOT_REQUIRED);
+        // Optional split parts for attention projections (along ne[1]).
+        load_split_parts(tn(LLM_TENSOR_ATTN_Q,   "weight", i).str(), n_embd,               layer.wq_parts,
+            [&](uint32_t k) { std::string s = "weight." + std::to_string(k); return tn(LLM_TENSOR_ATTN_Q,   s.c_str(), i); });
+        load_split_parts(tn(LLM_TENSOR_ATTN_K,   "weight", i).str(), n_embd,               layer.wk_parts,
+            [&](uint32_t k) { std::string s = "weight." + std::to_string(k); return tn(LLM_TENSOR_ATTN_K,   s.c_str(), i); });
+        load_split_parts(tn(LLM_TENSOR_ATTN_V,   "weight", i).str(), n_embd,               layer.wv_parts,
+            [&](uint32_t k) { std::string s = "weight." + std::to_string(k); return tn(LLM_TENSOR_ATTN_V,   s.c_str(), i); });
+        load_split_parts(tn(LLM_TENSOR_ATTN_OUT, "weight", i).str(), n_embd_head_k * n_head, layer.wo_parts,
+            [&](uint32_t k) { std::string s = "weight." + std::to_string(k); return tn(LLM_TENSOR_ATTN_OUT, s.c_str(), i); });
 
         // optional bias tensors
         layer.wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd}, TENSOR_NOT_REQUIRED);
@@ -190,7 +199,8 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             }
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il,
+                    model.layers[il].wo_parts);
             cb(cur, "attn_out", il);
         }
         if (il == n_layer - 1 && inp_out_ids) {

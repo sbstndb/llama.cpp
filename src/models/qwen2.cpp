@@ -53,8 +53,17 @@ void llama_model_qwen2::load_arch_tensors(llama_model_loader &) {
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
-        create_tensor_qkv(layer, i, n_embd, n_embd, n_embd_gqa, n_embd_gqa, 0);
-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, 0);
+        create_tensor_qkv(layer, i, n_embd, n_embd, n_embd_gqa, n_embd_gqa, TENSOR_NOT_REQUIRED);
+        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, TENSOR_NOT_REQUIRED);
+        // Optional split parts for attention projections (along ne[1], ne0 = n_embd).
+        load_split_parts(tn(LLM_TENSOR_ATTN_Q,     "weight", i).str(), n_embd, layer.wq_parts,
+            [&](uint32_t k) { std::string s = "weight." + std::to_string(k); return tn(LLM_TENSOR_ATTN_Q,     s.c_str(), i); });
+        load_split_parts(tn(LLM_TENSOR_ATTN_K,     "weight", i).str(), n_embd, layer.wk_parts,
+            [&](uint32_t k) { std::string s = "weight." + std::to_string(k); return tn(LLM_TENSOR_ATTN_K,     s.c_str(), i); });
+        load_split_parts(tn(LLM_TENSOR_ATTN_V,     "weight", i).str(), n_embd, layer.wv_parts,
+            [&](uint32_t k) { std::string s = "weight." + std::to_string(k); return tn(LLM_TENSOR_ATTN_V,     s.c_str(), i); });
+        load_split_parts(tn(LLM_TENSOR_ATTN_OUT,   "weight", i).str(), n_embd, layer.wo_parts,
+            [&](uint32_t k) { std::string s = "weight." + std::to_string(k); return tn(LLM_TENSOR_ATTN_OUT,   s.c_str(), i); });
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
@@ -128,7 +137,8 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
 
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il,
+                    model.layers[il].wo_parts);
         }
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
