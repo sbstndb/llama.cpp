@@ -44,6 +44,21 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
     if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
     }
+    // helper: load optional split parts of a weight split along ne[1].
+    auto load_split_parts = [&]<typename Maker>(const std::string & base, int64_t ne0,
+                                                 std::vector<ggml_tensor *> & parts, Maker mk_name) {
+        uint32_t sc = 0;
+        if (ml->get_key(base + ".split_count", sc, false) && sc > 0) {
+            for (uint32_t k = 0; k < sc; ++k) {
+                uint32_t sz = 0;
+                ml->get_key(base + ".split_size." + std::to_string(k), sz, true);
+                parts.push_back(create_tensor(mk_name(k), {ne0, (int64_t) sz}, TENSOR_NOT_REQUIRED));
+            }
+        }
+    };
+    // Optional split LM head (along n_vocab)
+    load_split_parts(tn(LLM_TENSOR_OUTPUT, "weight").str(), n_embd, output_parts,
+        [&](uint32_t k) { std::string s = "weight." + std::to_string(k); return tn(LLM_TENSOR_OUTPUT, s.c_str()); });
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
@@ -67,23 +82,16 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
         }
 
         if (n_expert == 0) {
-            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, TENSOR_NOT_REQUIRED);
             layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, TENSOR_NOT_REQUIRED);
-            // Optional generic split: ffn_down split into N row-groups along ne[1] (n_embd).
-            {
-                std::string base = tn(LLM_TENSOR_FFN_DOWN, "weight", i).str();
-                uint32_t split_count = 0;
-                if (ml->get_key(base + ".split_count", split_count, false) && split_count > 0) {
-                    for (uint32_t k = 0; k < split_count; ++k) {
-                        uint32_t sz = 0;
-                        ml->get_key(base + ".split_size." + std::to_string(k), sz, true);
-                        std::string suf = "weight." + std::to_string(k);
-                        layer.ffn_down_parts.push_back(
-                            create_tensor(tn(LLM_TENSOR_FFN_DOWN, suf.c_str(), i), {n_ff, (int64_t) sz}, TENSOR_NOT_REQUIRED));
-                    }
-                }
-            }
-            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, TENSOR_NOT_REQUIRED);
+            // Optional split parts (along ne[1]). gate & up MUST share boundaries.
+            load_split_parts(tn(LLM_TENSOR_FFN_DOWN, "weight", i).str(), n_ff,   layer.ffn_down_parts,
+                [&](uint32_t k) { std::string s = "weight." + std::to_string(k); return tn(LLM_TENSOR_FFN_DOWN, s.c_str(), i); });
+            load_split_parts(tn(LLM_TENSOR_FFN_UP,   "weight", i).str(), n_embd, layer.ffn_up_parts,
+                [&](uint32_t k) { std::string s = "weight." + std::to_string(k); return tn(LLM_TENSOR_FFN_UP,   s.c_str(), i); });
+            load_split_parts(tn(LLM_TENSOR_FFN_GATE, "weight", i).str(), n_embd, layer.ffn_gate_parts,
+                [&](uint32_t k) { std::string s = "weight." + std::to_string(k); return tn(LLM_TENSOR_FFN_GATE, s.c_str(), i); });
 
             // optional MLP bias
             layer.ffn_gate_b = create_tensor(tn(LLM_TENSOR_FFN_GATE, "bias", i), {n_ff}, TENSOR_NOT_REQUIRED);
@@ -206,7 +214,9 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
                     NULL,
                     LLM_FFN_SILU, LLM_FFN_PAR, il,
-                    model.layers[il].ffn_down_parts);
+                    model.layers[il].ffn_down_parts,
+                    model.layers[il].ffn_up_parts,
+                    model.layers[il].ffn_gate_parts);
             cb(cur, "ffn_out", il);
         } else {
             // MoE branch
@@ -251,8 +261,10 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     res->t_embd = cur;
 
     if constexpr (!embed) {
-        // lm_head
-        cur = build_lora_mm(model.output, cur, model.output_s);
+        // lm_head (optionally reconstructed from split output parts along n_vocab)
+        cur = model.output_parts.empty()
+            ? build_lora_mm(model.output, cur, model.output_s)
+            : build_mm_split(nullptr, model.output_parts, cur);
 
         cb(cur, "result_output", -1);
         res->t_logits = cur;

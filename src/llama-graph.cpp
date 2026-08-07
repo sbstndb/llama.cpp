@@ -1560,6 +1560,24 @@ llm_graph_qkv llm_graph_context::build_qkv(
     return { Qcur, Kcur, Vcur };
 }
 
+ggml_tensor * llm_graph_context::build_mm_split(
+        ggml_tensor * w,
+  const std::vector<ggml_tensor *> & w_parts,
+        ggml_tensor * cur) const {
+
+    if (!w_parts.empty()) {
+        // Split weight: mul_mat each part against the SAME activation, concat
+        // the partial results along ne[0] (output dim) to reconstruct w.
+        auto * acc = ggml_mul_mat(ctx0, w_parts[0], cur);
+        for (size_t i = 1; i < w_parts.size(); ++i) {
+            auto * r = ggml_mul_mat(ctx0, w_parts[i], cur);
+            acc = ggml_concat(ctx0, acc, r, 0);
+        }
+        return acc;
+    }
+    return build_lora_mm(w, cur);
+}
+
 
 ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * cur,
@@ -1576,7 +1594,9 @@ ggml_tensor * llm_graph_context::build_ffn(
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
                  int   il,
-         std::vector<ggml_tensor *> down_parts) const {
+         std::vector<ggml_tensor *> down_parts,
+         std::vector<ggml_tensor *> up_parts,
+         std::vector<ggml_tensor *> gate_parts) const {
     // NVFP4 support is currently restricted to
     // 1) LORA absence (*_s would be applied after LORA residual, which is incorrect)
     // 2) bias absense (*_s would be applied after bias addition, which is incorrect)
@@ -1600,7 +1620,13 @@ ggml_tensor * llm_graph_context::build_ffn(
     GGML_ASSERT(!gate_s || !gate || gate->type != GGML_TYPE_NVFP4 || !has_lora(gate));
     GGML_ASSERT(!down_s || !down || down->type != GGML_TYPE_NVFP4 || !has_lora(down));
 
-    ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
+    // A weight is "present" if it has its base tensor OR split parts. The gate
+    // activation logic below keys off `gate`, which is null when the weight is
+    // split — so use has_gate/has_up there.
+    const bool has_up   = up   || !up_parts.empty();
+    const bool has_gate = gate || !gate_parts.empty();
+
+    ggml_tensor * tmp = has_up ? build_mm_split(up, up_parts, cur) : cur;
     cb(tmp, "ffn_up", il);
 
     if (up_b) {
@@ -1613,16 +1639,16 @@ ggml_tensor * llm_graph_context::build_ffn(
         cb(tmp, "ffn_up_s", il);
     }
 
-    if (gate) {
+    if (has_gate) {
         switch (type_gate) {
             case LLM_FFN_SEQ:
                 {
-                    cur = build_lora_mm(gate, tmp);
+                    cur = build_mm_split(gate, gate_parts, tmp);
                     cb(cur, "ffn_gate", il);
                 } break;
             case LLM_FFN_PAR:
                 {
-                    cur = build_lora_mm(gate, cur);
+                    cur = build_mm_split(gate, gate_parts, cur);
                     cb(cur, "ffn_gate", il);
                 } break;
         }
@@ -1643,7 +1669,7 @@ ggml_tensor * llm_graph_context::build_ffn(
 
     switch (type_op) {
         case LLM_FFN_SILU:
-            if (gate && type_gate == LLM_FFN_PAR) {
+            if (has_gate && type_gate == LLM_FFN_PAR) {
                 if (il >= 0) {
                     const float limit = hparams.swiglu_clamp_shexp[il];
                     constexpr float eps = 1e-6f;
@@ -1676,7 +1702,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                 cb(cur, "ffn_silu", il);
             } break;
         case LLM_FFN_GELU:
-            if (gate && type_gate == LLM_FFN_PAR) {
+            if (has_gate && type_gate == LLM_FFN_PAR) {
                 cur = ggml_geglu_split(ctx0, cur, tmp);
                 cb(cur, "ffn_geglu", il);
                 type_gate = LLM_FFN_SEQ;
@@ -1689,7 +1715,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                 }
             } break;
         case LLM_FFN_RELU:
-            if (gate && type_gate == LLM_FFN_PAR) {
+            if (has_gate && type_gate == LLM_FFN_PAR) {
                 cur = ggml_reglu_split(ctx0, cur, tmp);
                 cb(cur, "ffn_reglu", il);
                 type_gate = LLM_FFN_SEQ;
@@ -1711,7 +1737,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                 cb(cur, "ffn_swiglu", il);
             } break;
         case LLM_FFN_SWIGLU_OAI_MOE:
-            if (gate && type_gate == LLM_FFN_PAR) {
+            if (has_gate && type_gate == LLM_FFN_PAR) {
                 // same alpha/limit constants as gpt-oss
                 const float alpha = 1.702f;
                 const float limit = 7.0f;
@@ -1735,27 +1761,17 @@ ggml_tensor * llm_graph_context::build_ffn(
             GGML_ABORT("fatal error");
     }
 
-    if (gate && type_gate == LLM_FFN_PAR) {
+    if (has_gate && type_gate == LLM_FFN_PAR) {
         cur = ggml_mul(ctx0, cur, tmp);
         cb(cur, "ffn_gate_par", il);
     }
 
-    if (down) {
-        cur = build_lora_mm(down, cur);
+    if (down || !down_parts.empty()) {
+        cur = build_mm_split(down, down_parts, cur);
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
         }
-    } else if (!down_parts.empty()) {
-        // Generic N-way split: mul_mat each part against the SAME activation,
-        // then concat all partial results along ne[0] (output dim) to rebuild ffn_down.
-        // NOTE: do not clobber `cur` (the activation) — keep it for every part.
-        auto * acc = ggml_mul_mat(ctx0, down_parts[0], cur);
-        for (size_t i = 1; i < down_parts.size(); ++i) {
-            auto * r = ggml_mul_mat(ctx0, down_parts[i], cur);
-            acc = ggml_concat(ctx0, acc, r, 0);
-        }
-        cur = acc;
     }
 
     if (down_b) {

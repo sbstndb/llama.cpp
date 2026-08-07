@@ -996,7 +996,17 @@ struct llm_graph_context {
          llm_ffn_op_type   type_op,
        llm_ffn_gate_type   type_gate,
                      int   il,
-             std::vector<ggml_tensor *> down_parts = {}) const;
+             std::vector<ggml_tensor *> down_parts = {},
+             std::vector<ggml_tensor *> up_parts   = {},
+             std::vector<ggml_tensor *> gate_parts = {}) const;
+
+    // mul_mat against `cur`, or — if the weight is split into contiguous parts —
+    // mul_mat each part against the SAME cur and concat along ne[0] (output dim).
+    // Used to reconstruct a split weight (ffn_down/up/gate, output) from parts.
+    ggml_tensor * build_mm_split(
+             ggml_tensor * w,
+      const std::vector<ggml_tensor *> & w_parts,
+             ggml_tensor * cur) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(
