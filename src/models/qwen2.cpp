@@ -41,7 +41,18 @@ void llama_model_qwen2::load_arch_tensors(llama_model_loader &) {
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, TENSOR_NOT_REQUIRED);
+        // Optional split parts (split along ne[1] = n_embd = output dim)
+        {
+            std::string split_key = tn(LLM_TENSOR_FFN_DOWN, "weight", i).str() + ".split_rows";
+            uint32_t split_rows = 0;
+            if (ml->get_key(split_key, split_rows, false)) {
+                const int64_t n_embd_part0 = split_rows;
+                const int64_t n_embd_part1 = n_embd - n_embd_part0;
+                layer.ffn_down_part0 = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight.0", i), {n_ff, n_embd_part0}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_part1 = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight.1", i), {n_ff, n_embd_part1}, TENSOR_NOT_REQUIRED);
+            }
+        }
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
     }
 }
@@ -121,7 +132,8 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
                 model.layers[il].ffn_gate, NULL, NULL,
                 model.layers[il].ffn_down, NULL, NULL,
                 NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+                LLM_FFN_SILU, LLM_FFN_PAR, il,
+                model.layers[il].ffn_down_part0, model.layers[il].ffn_down_part1);
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, cur, ffn_inp);

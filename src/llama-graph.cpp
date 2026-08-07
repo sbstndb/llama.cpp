@@ -1575,7 +1575,9 @@ ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * act_scales,
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * down_part0,
+         ggml_tensor * down_part1) const {
     // NVFP4 support is currently restricted to
     // 1) LORA absence (*_s would be applied after LORA residual, which is incorrect)
     // 2) bias absense (*_s would be applied after bias addition, which is incorrect)
@@ -1745,6 +1747,10 @@ ggml_tensor * llm_graph_context::build_ffn(
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
         }
+    } else if (down_part0 && down_part1) {
+        auto * r0 = ggml_mul_mat(ctx0, down_part0, cur);
+        auto * r1 = ggml_mul_mat(ctx0, down_part1, cur);
+        cur = ggml_concat(ctx0, r0, r1, 0);
     }
 
     if (down_b) {
